@@ -2,11 +2,16 @@
 Gaussian Pointcloud Toolkit  (COLMAP SOR cleaner + format converters)
 =====================================================================
 
-Landing page = the iterative SOR cleaner: open a points3D.txt, then loop
+Landing page = the iterative SOR cleaner: open a cloud, then loop
 Preview -> Delete -> reframe to strip outliers/floaters in-session, with a live
 3D viewer that draws EVERY point (kept = grey, removed = red) and shows counts.
 
-  File menu    : Open / Save points3D.txt
+Opens both COLMAP points3D.txt and .ply (ascii or binary). For PLY, every
+vertex is kept as one record, so ALL per-vertex attributes (rgb, normals, and
+Gaussian-splat fields: f_dc_*, f_rest_*, opacity, scale_*, rot_*) stay bound to
+their point and are written back with identical types/order - no mismatch.
+
+  File menu    : Open / Save cloud (.txt or .ply)
   Toolkit menu : points3D.txt <-> PLY converters (home for future helper tools)
 
 Headless / batch use (no window):
@@ -29,6 +34,11 @@ from tkinter import ttk, filedialog, messagebox
 
 try:
     import numpy as np
+    _HAVE_NUMPY = True
+except Exception:
+    _HAVE_NUMPY = False
+
+try:
     from scipy.spatial import cKDTree
     _HAVE_SCIPY = True
 except Exception:
@@ -137,6 +147,144 @@ def ply_to_points3d(src, dst, log):
         pts.append((x, y, z, r, g, b))
     save_points3d(dst, pts)
     log(f"OK  -  wrote {len(pts)} points to:\n     {dst}")
+
+
+# ==========================================================================
+#  Full-attribute PLY reader / writer  (numpy structured array)
+# --------------------------------------------------------------------------
+#  Every vertex is ONE record holding ALL its properties (xyz, normals, rgb,
+#  and any Gaussian-splat fields: f_dc_*, f_rest_*, opacity, scale_*, rot_*).
+#  Deleting a point drops the whole record, so attributes never mismatch, and
+#  kept points are written back byte-for-byte with the original types/order.
+# ==========================================================================
+_PLY_TYPES = {
+    "char": "i1", "int8": "i1", "uchar": "u1", "uint8": "u1",
+    "short": "i2", "int16": "i2", "ushort": "u2", "uint16": "u2",
+    "int": "i4", "int32": "i4", "uint": "u4", "uint32": "u4",
+    "float": "f4", "float32": "f4", "double": "f8", "float64": "f8",
+}
+
+
+def read_ply(path):
+    """Return (meta, data) where data is a numpy structured array of vertices.
+
+    meta = {"format": <ascii|binary_little_endian|binary_big_endian>,
+            "props": [(name, ply_type), ...], "comments": [...]}
+    """
+    if not _HAVE_NUMPY:
+        raise ValueError("Reading .ply needs numpy  ->  pip install numpy")
+
+    with open(path, "rb") as f:
+        if f.readline().strip() != b"ply":
+            raise ValueError("Not a PLY file (missing 'ply' header).")
+        fmt, comments, elements, cur = None, [], [], None
+        while True:
+            raw = f.readline()
+            if not raw:
+                raise ValueError("Unexpected end of PLY header.")
+            line = raw.decode("ascii", "replace").strip()
+            if line == "end_header":
+                break
+            if not line:
+                continue
+            t = line.split()
+            if t[0] == "format":
+                fmt = t[1]
+            elif t[0] == "comment":
+                comments.append(line[7:].strip())
+            elif t[0] == "element":
+                cur = {"name": t[1], "count": int(t[2]), "props": []}
+                elements.append(cur)
+            elif t[0] == "property":
+                if cur is None:
+                    raise ValueError("PLY 'property' before any 'element'.")
+                if t[1] == "list":
+                    cur["props"].append(("__list__", None))
+                else:
+                    cur["props"].append((t[2], t[1]))
+        blob = f.read()
+
+    vert = next((e for e in elements if e["name"] == "vertex"), None)
+    if vert is None:
+        raise ValueError("PLY has no 'vertex' element.")
+    for e in elements:
+        if e is not vert and e["count"] > 0:
+            raise ValueError(
+                f"PLY contains a '{e['name']}' element ({e['count']} items). "
+                "Only vertex-only point clouds are supported.")
+    props = vert["props"]
+    names = [nm for nm, _ in props]
+    for nm, ty in props:
+        if nm == "__list__":
+            raise ValueError("PLY vertex has a 'list' property; not a plain "
+                             "point cloud.")
+        if ty not in _PLY_TYPES:
+            raise ValueError(f"Unsupported PLY property type: {ty}")
+    for req in ("x", "y", "z"):
+        if req not in names:
+            raise ValueError(f"PLY vertex has no '{req}' coordinate.")
+
+    count = vert["count"]
+    if fmt == "ascii":
+        rows = []
+        for line in blob.decode("ascii", "replace").splitlines():
+            if not line.strip():
+                continue
+            parts = line.split()
+            if len(parts) < len(props):
+                continue
+            rows.append(parts[:len(props)])
+            if len(rows) >= count:
+                break
+        dt = np.dtype([(nm, _PLY_TYPES[ty]) for nm, ty in props])
+        data = np.empty(len(rows), dtype=dt)
+        for j, (nm, ty) in enumerate(props):
+            data[nm] = np.array([r[j] for r in rows], dtype=_PLY_TYPES[ty])
+    else:
+        endian = "<" if "little" in fmt else ">"
+        dt = np.dtype([(nm, endian + _PLY_TYPES[ty]) for nm, ty in props])
+        data = np.frombuffer(blob, dtype=dt, count=count).copy()
+
+    return {"format": fmt, "props": props, "comments": comments}, data
+
+
+def write_ply(path, meta, data):
+    """Write a vertex-only PLY, preserving the original format/types/order."""
+    props = meta["props"]
+    fmt = meta["format"]
+    n = len(data)
+    with open(path, "wb") as f:
+        def w(s):
+            f.write((s + "\n").encode("ascii"))
+        w("ply")
+        w(f"format {fmt} 1.0")
+        for c in meta.get("comments", []):
+            w(f"comment {c}")
+        w("comment cleaned with Gaussian Pointcloud Toolkit")
+        w(f"element vertex {n}")
+        for nm, ty in props:
+            w(f"property {ty} {nm}")
+        w("end_header")
+        if fmt == "ascii":
+            for rec in data:
+                out = []
+                for nm, ty in props:
+                    v = rec[nm]
+                    out.append(repr(float(v)) if ty in
+                               ("float", "float32", "double", "float64")
+                               else str(int(v)))
+                f.write((" ".join(out) + "\n").encode("ascii"))
+        else:
+            endian = "<" if "little" in fmt else ">"
+            dt = np.dtype([(nm, endian + _PLY_TYPES[ty]) for nm, ty in props])
+            f.write(np.ascontiguousarray(data.astype(dt, copy=False)).tobytes())
+
+
+def _take(rows, idx):
+    """Subset rows by a list of indices (works for python lists and ndarrays)."""
+    if isinstance(rows, list):
+        return [rows[i] for i in idx]
+    return rows[idx]
 
 
 # ==========================================================================
@@ -286,8 +434,13 @@ class App(tk.Tk):
         super().__init__()
         self.title("COLMAP point cleaner  -  SOR")
 
-        # working set (empty until a points3D.txt is opened)
+        # working set (empty until a cloud is opened)
+        # self.pts holds the point records:
+        #   COLMAP  -> list of (x,y,z,r,g,b) string tuples
+        #   PLY     -> numpy structured array (all vertex attributes preserved)
         self.pts = []
+        self.fmt = "colmap"              # "colmap" or "ply"
+        self.ply_meta = None             # header info for PLY round-trip
         self.fx, self.fy, self.fz = [], [], []
         self.keep = []
         self.idx_keep, self.idx_drop = [], []
@@ -313,7 +466,7 @@ class App(tk.Tk):
         panel = ttk.Frame(self, padding=8)
         panel.pack(side="left", fill="y")
 
-        ttk.Button(panel, text="Open points3D.txt ...",
+        ttk.Button(panel, text="Open cloud (.txt / .ply) ...",
                    command=self.open_file).pack(fill="x", pady=(0, 8))
 
         ttk.Label(panel, text="SOR parameters",
@@ -397,14 +550,14 @@ class App(tk.Tk):
     # ---- rendering ----------------------------------------------------
     def render(self):
         W, H = self.W, self.H
-        if not self.pts:
+        if len(self.pts) == 0:
             self.canvas.itemconfig(self.img_id, image="")
             self.canvas.delete("hint")
             self.canvas.create_text(
                 W // 2, H // 2, tags="hint", fill="#666",
                 font=("Segoe UI", 13), justify="center",
-                text="Open a points3D.txt to begin\n"
-                     "( File > Open,  or the button on the left )")
+                text="Open a point cloud to begin\n"
+                     "( points3D.txt  or  .ply  -  File > Open )")
             return
         self.canvas.delete("hint")
         buf = bytearray(b"\x0f\x0f\x14" * (W * H))  # background fill
@@ -492,7 +645,7 @@ class App(tk.Tk):
         # snapshot for undo
         self.history.append((self.pts, self.fx, self.fy, self.fz))
         keep_idx = self.idx_keep
-        self.pts = [self.pts[i] for i in keep_idx]
+        self.pts = _take(self.pts, keep_idx)          # ndarray or list, atomic
         self.fx = [self.fx[i] for i in keep_idx]
         self.fy = [self.fy[i] for i in keep_idx]
         self.fz = [self.fz[i] for i in keep_idx]
@@ -523,23 +676,33 @@ class App(tk.Tk):
         self.render()
 
     def save(self):
-        if not self.pts:
-            messagebox.showinfo("Save", "Open a points3D.txt first.")
+        if not self.fx:
+            messagebox.showinfo("Save", "Open a point cloud first.")
             return
-        kept = [self.pts[i] for i in self.idx_keep]   # excludes pending red
-        out = filedialog.asksaveasfilename(
-            title="Save cleaned points3D.txt",
-            defaultextension=".txt",
-            initialfile=os.path.basename(self.default_out),
-            initialdir=os.path.dirname(self.default_out),
-            filetypes=[("COLMAP points3D", "*.txt")])
-        if not out:
-            return
-        save_points3d(out, kept)
+        kept = _take(self.pts, self.idx_keep)   # excludes pending red points
+        nkept = len(kept)
+        if self.fmt == "ply":
+            out = filedialog.asksaveasfilename(
+                title="Save cleaned PLY", defaultextension=".ply",
+                initialfile=os.path.basename(self.default_out),
+                initialdir=os.path.dirname(self.default_out),
+                filetypes=[("PLY point cloud", "*.ply")])
+            if not out:
+                return
+            write_ply(out, self.ply_meta, kept)
+        else:
+            out = filedialog.asksaveasfilename(
+                title="Save cleaned points3D.txt", defaultextension=".txt",
+                initialfile=os.path.basename(self.default_out),
+                initialdir=os.path.dirname(self.default_out),
+                filetypes=[("COLMAP points3D", "*.txt")])
+            if not out:
+                return
+            save_points3d(out, kept)
         messagebox.showinfo(
             "Saved",
-            f"Wrote {len(kept)} points to:\n{out}\n\n"
-            f"({self.orig_total - len(kept)} removed in "
+            f"Wrote {nkept} points to:\n{out}\n\n"
+            f"({self.orig_total - nkept} removed in "
             f"{self.applied} delete pass(es))")
 
 
@@ -548,9 +711,9 @@ class App(tk.Tk):
         bar = tk.Menu(self, tearoff=0)
 
         filem = tk.Menu(bar, tearoff=0)
-        filem.add_command(label="Open points3D.txt ...", command=self.open_file)
-        filem.add_command(label="Save cleaned points3D.txt ...",
-                          command=self.save)
+        filem.add_command(label="Open point cloud (.txt / .ply) ...",
+                          command=self.open_file)
+        filem.add_command(label="Save cleaned cloud ...", command=self.save)
         filem.add_separator()
         filem.add_command(label="Exit", command=self.destroy)
         bar.add_cascade(label="File", menu=filem)
@@ -567,46 +730,73 @@ class App(tk.Tk):
 
         self.config(menu=bar)
 
-    # ---- open a cloud + first SOR preview ----------------------------
+    # ---- open a cloud (.txt or .ply) + first SOR preview -------------
     def open_file(self):
         p = filedialog.askopenfilename(
-            title="Open COLMAP points3D.txt",
-            filetypes=[("COLMAP points3D", "*.txt"), ("All files", "*.*")],
+            title="Open point cloud  (points3D.txt or .ply)",
+            filetypes=[("Point clouds", "*.txt *.ply"),
+                       ("COLMAP points3D", "*.txt"),
+                       ("PLY point cloud", "*.ply"),
+                       ("All files", "*.*")],
             initialdir=os.path.dirname(self.default_out) or os.path.dirname(__file__))
         if not p:
             return
         self.config(cursor="watch")
+        dropped = 0
         try:
-            raw = load_points3d(p)
-            if not raw:
-                raise ValueError("No points found in file.")
-            # keep only points with finite, parseable coordinates
-            # (RealityCapture sometimes emits NaN/inf junk points, and a
-            #  single non-finite value crashes the KD-tree).
-            pts, fx, fy, fz, dropped = [], [], [], [], 0
-            isfinite = math.isfinite
-            for q in raw:
-                try:
-                    x, y, z = float(q[0]), float(q[1]), float(q[2])
-                except (ValueError, IndexError):
-                    dropped += 1
-                    continue
-                if not (isfinite(x) and isfinite(y) and isfinite(z)):
-                    dropped += 1
-                    continue
-                pts.append(q)
-                fx.append(x)
-                fy.append(y)
-                fz.append(z)
-            if not pts:
-                raise ValueError("File has no valid (finite) points.")
+            if p.lower().endswith(".ply"):
+                # PLY: every vertex kept as one record so ALL attributes
+                # (rgb, normals, splat fields...) stay bound to their point.
+                meta, data = read_ply(p)
+                if len(data) == 0:
+                    raise ValueError("PLY has no vertices.")
+                x = np.asarray(data["x"], dtype=np.float64)
+                y = np.asarray(data["y"], dtype=np.float64)
+                z = np.asarray(data["z"], dtype=np.float64)
+                mask = np.isfinite(x) & np.isfinite(y) & np.isfinite(z)
+                dropped = int((~mask).sum())
+                if not mask.any():
+                    raise ValueError("PLY has no finite points.")
+                rows = data[mask]
+                fx = x[mask].tolist()
+                fy = y[mask].tolist()
+                fz = z[mask].tolist()
+                fmt, ply_meta = "ply", meta
+                default_out = os.path.splitext(p)[0] + "_clean.ply"
+            else:
+                # COLMAP points3D.txt : drop non-finite / unparseable rows
+                raw = load_points3d(p)
+                if not raw:
+                    raise ValueError("No points found in file.")
+                rows, fx, fy, fz = [], [], [], []
+                isfinite = math.isfinite
+                for q in raw:
+                    try:
+                        x, y, z = float(q[0]), float(q[1]), float(q[2])
+                    except (ValueError, IndexError):
+                        dropped += 1
+                        continue
+                    if not (isfinite(x) and isfinite(y) and isfinite(z)):
+                        dropped += 1
+                        continue
+                    rows.append(q)
+                    fx.append(x)
+                    fy.append(y)
+                    fz.append(z)
+                if not rows:
+                    raise ValueError("File has no valid (finite) points.")
+                fmt, ply_meta = "colmap", None
+                default_out = os.path.splitext(p)[0] + "_clean.txt"
 
-            self.pts, self.fx, self.fy, self.fz = pts, fx, fy, fz
-            self.orig_total = len(pts)
+            self.pts = rows
+            self.fmt = fmt
+            self.ply_meta = ply_meta
+            self.fx, self.fy, self.fz = fx, fy, fz
+            self.orig_total = len(fx)
             self.applied = 0
             self.history = []
-            self.default_out = os.path.splitext(p)[0] + "_clean.txt"
-            self.title(f"COLMAP point cleaner  -  {os.path.basename(p)}")
+            self.default_out = default_out
+            self.title(f"point cleaner  -  {os.path.basename(p)}")
 
             self.update()
             keep, *_ = compute_sor(self.fx, self.fy, self.fz,
@@ -626,7 +816,7 @@ class App(tk.Tk):
         if dropped:
             messagebox.showinfo(
                 "Loaded",
-                f"Loaded {len(pts)} points.\n"
+                f"Loaded {len(self.fx)} points.\n"
                 f"Skipped {dropped} invalid / non-finite point(s).")
 
     # ---- Toolkit : format converters ---------------------------------

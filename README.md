@@ -11,7 +11,13 @@ in an **iterative 3D editor** — no CloudCompare round-trip, no export/reimport
 
 ## Features
 
-- **Landing page = the SOR cleaner.** Open a `points3D.txt` and work directly.
+- **Landing page = the SOR cleaner.** Open a `points3D.txt` **or a `.ply`**
+  (ASCII or binary) and work directly.
+- **Full-attribute PLY support.** Every vertex is kept as one record, so all
+  per-vertex attributes — rgb, normals, and Gaussian-splat fields
+  (`f_dc_*`, `f_rest_*`, `opacity`, `scale_*`, `rot_*`) — stay bound to their
+  point and are written back with identical types/order. Deleting a point drops
+  its whole record, so **attributes never mismatch**.
 - **Iterate loop:** *Preview* (marks outliers red) → *Delete red + reframe* →
   repeat on the already-cleaned cloud, with full **Undo** history.
 - **3D viewer draws every point** via a hand-rolled software renderer
