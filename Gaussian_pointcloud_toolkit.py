@@ -575,35 +575,59 @@ class App(tk.Tk):
             initialdir=os.path.dirname(self.default_out) or os.path.dirname(__file__))
         if not p:
             return
-        try:
-            pts = load_points3d(p)
-        except Exception as e:
-            messagebox.showerror("Open failed", str(e))
-            return
-        if not pts:
-            messagebox.showerror("Open failed", "No points found in file.")
-            return
-        self.pts = pts
-        self.fx = [float(q[0]) for q in pts]
-        self.fy = [float(q[1]) for q in pts]
-        self.fz = [float(q[2]) for q in pts]
-        self.orig_total = len(pts)
-        self.applied = 0
-        self.history = []
-        self.default_out = os.path.splitext(p)[0] + "_clean.txt"
-        self.title(f"COLMAP point cleaner  -  {os.path.basename(p)}")
-
         self.config(cursor="watch")
-        self.update()
-        keep, *_ = compute_sor(self.fx, self.fy, self.fz,
-                               k=self.k_var.get(), sigma=self.s_var.get())
-        self.keep = keep
-        self.config(cursor="")
-        self._fit()
-        self.zoom = 1.0
-        self._split_indices()
-        self.update_counts()
-        self.render()
+        try:
+            raw = load_points3d(p)
+            if not raw:
+                raise ValueError("No points found in file.")
+            # keep only points with finite, parseable coordinates
+            # (RealityCapture sometimes emits NaN/inf junk points, and a
+            #  single non-finite value crashes the KD-tree).
+            pts, fx, fy, fz, dropped = [], [], [], [], 0
+            isfinite = math.isfinite
+            for q in raw:
+                try:
+                    x, y, z = float(q[0]), float(q[1]), float(q[2])
+                except (ValueError, IndexError):
+                    dropped += 1
+                    continue
+                if not (isfinite(x) and isfinite(y) and isfinite(z)):
+                    dropped += 1
+                    continue
+                pts.append(q)
+                fx.append(x)
+                fy.append(y)
+                fz.append(z)
+            if not pts:
+                raise ValueError("File has no valid (finite) points.")
+
+            self.pts, self.fx, self.fy, self.fz = pts, fx, fy, fz
+            self.orig_total = len(pts)
+            self.applied = 0
+            self.history = []
+            self.default_out = os.path.splitext(p)[0] + "_clean.txt"
+            self.title(f"COLMAP point cleaner  -  {os.path.basename(p)}")
+
+            self.update()
+            keep, *_ = compute_sor(self.fx, self.fy, self.fz,
+                                   k=self.k_var.get(), sigma=self.s_var.get())
+            self.keep = keep
+            self._fit()
+            self.zoom = 1.0
+            self._split_indices()
+            self.update_counts()
+            self.render()
+        except Exception as e:
+            messagebox.showerror("Open failed", f"{type(e).__name__}: {e}")
+            return
+        finally:
+            self.config(cursor="")
+
+        if dropped:
+            messagebox.showinfo(
+                "Loaded",
+                f"Loaded {len(pts)} points.\n"
+                f"Skipped {dropped} invalid / non-finite point(s).")
 
     # ---- Toolkit : format converters ---------------------------------
     def tool_convert(self, which):
